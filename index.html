@@ -1,0 +1,586 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>DEI — Full Body AR (SDK Version)</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{overflow:hidden;background:#000;font-family:'Courier New',monospace}
+#bgVid{position:fixed;top:0;left:0;width:100vw;height:100vh;object-fit:cover;transform:scaleX(-1);z-index:0}
+#c{position:fixed;top:0;left:0;width:100vw;height:100vh;z-index:1}
+#hud{position:fixed;top:14px;left:50%;transform:translateX(-50%);color:rgba(100,220,255,0.9);font-size:12px;z-index:20;text-align:center;background:rgba(0,0,0,0.5);padding:5px 16px;border-radius:6px;pointer-events:none;backdrop-filter:blur(4px);max-width:520px}
+#voiceBar{position:fixed;bottom:46px;left:50%;transform:translateX(-50%);z-index:20;background:rgba(0,0,0,0.75);border:1px solid rgba(100,200,255,0.2);border-radius:8px;padding:8px 18px;min-width:320px;backdrop-filter:blur(8px)}
+.vLbl{font-size:9px;color:rgba(100,200,255,0.6);display:flex;align-items:center;gap:5px;margin-bottom:2px}
+.dot{width:7px;height:7px;border-radius:50%}.dot.on{background:#44ff88;animation:pu 1s infinite}.dot.off{background:#ff4444}.dot.wait{background:#ffaa44;animation:pu 1.5s infinite}
+@keyframes pu{0%,100%{opacity:1}50%{opacity:.3}}
+.vTx{font-size:13px;color:#ddeeff;min-height:18px;margin:2px 0}.vSt{font-size:9px;color:rgba(150,180,200,.5)}
+#agentBox{position:fixed;top:70px;right:14px;z-index:20;width:280px;background:rgba(0,10,20,.85);border:1px solid rgba(60,140,200,.3);border-radius:10px;padding:12px;backdrop-filter:blur(6px);transition:opacity .3s;opacity:0;pointer-events:none}
+#agentBox.show{opacity:1}.aT{font-size:9px;color:rgba(100,180,255,.6);margin-bottom:4px}.aM{font-size:12px;color:rgba(200,230,255,.95);line-height:1.5}
+#btns{position:fixed;bottom:10px;right:14px;z-index:20;display:flex;gap:6px}
+#btns button{padding:6px 12px;background:rgba(40,80,140,.5);color:#88ccff;border:1px solid rgba(80,160,255,.3);border-radius:6px;cursor:pointer;font-family:inherit;font-size:10px}
+#debug{position:fixed;bottom:10px;left:10px;font-size:8px;z-index:20;color:rgba(80,200,160,.35);pointer-events:none;white-space:pre}
+video.h{display:none}
+</style>
+</head>
+<body>
+<video id="bgVid" playsinline muted></video>
+<canvas id="c"></canvas>
+<div id="hud">Loading SDK...</div>
+<div id="voiceBar"><div class="vLbl"><span class="dot off" id="vDot"></span><span id="vLbl">Init...</span></div><div class="vTx" id="vTx"></div><div class="vSt" id="vSt"></div></div>
+<div id="agentBox"><div class="aT">🤖 DEI</div><div class="aM" id="aM"></div></div>
+<div id="btns">
+  <button onclick="window._sp('ball')">🏀 Ball</button>
+  <button onclick="window._sp('bird')">🐦 Bird</button>
+  <button onclick="window._sp('fly')">✈ Fly</button>
+  <button onclick="window._sp('bfly')">🦋 Butterfly</button>
+  <button onclick="window._sp('fire')">🔥 Fire</button>
+  <button onclick="window._sp('hide')">❌ Hide</button>
+</div>
+<div id="debug"></div>
+<video id="vid" class="h" playsinline></video>
+
+<script type="importmap">
+{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"}}
+</script>
+<script type="module">
+/**
+ * DEI Demo — built on hopeOS SDK modules.
+ * Behavior parity with old monolithic dei_full.html:
+ *   - Ball: grab/throw with cannon-es physics, two-hand pinch zoom, spawn anim
+ *   - Bird: orbit flight, body avoidance
+ *   - Butterfly: orbit body, LAND ON RAISED HAND (the key fix)
+ *   - Fire: hand-attached volumetric fire
+ */
+import { HopeOS } from './sdk/hopeos.js';
+import { isPinch, pinchPoint, palmCenter, handQuaternion, GrabState } from './sdk/interaction/grab.js';
+import { registerSphere, colliders } from './sdk/interaction/colliders.js';
+import { loadModel } from './sdk/assets/loader.js';
+import CFG from './dei_config.js';
+
+// ── DOM refs ──
+const els = {
+  hud: document.getElementById('hud'),
+  db: document.getElementById('debug'),
+  vDot: document.getElementById('vDot'),
+  vLbl: document.getElementById('vLbl'),
+  vTx: document.getElementById('vTx'),
+  aBox: document.getElementById('agentBox'),
+  aMsg: document.getElementById('aM')
+};
+function showAgent(m, d = 3500) {
+  els.aMsg.textContent = m; els.aBox.classList.add('show');
+  clearTimeout(els.aBox._t);
+  els.aBox._t = setTimeout(() => els.aBox.classList.remove('show'), d);
+}
+
+// ── Game state ──
+let hope = null;
+
+// ═══════════════ BASKETBALL STATE (1:1 port of dei_full.html) ═══════════════
+let ball = null;
+let ballBaseScale = 1, ballRawR = 3.3;   // ballRawR recomputed on load
+let ballState = 'hidden', ballScale = 1, ballPhysActive = false;
+let ballPos, ballQuat;
+let prevPD = 0, ballGrabbed = false, grabHand = -1, grabOff, grabQO;
+let grabVelHistory = [];
+let ballBody = null;
+const ballCollider = registerSphere(null, 0, false);
+
+// World-space ball radius = rawRadius × loadScale × dynamicScale  (= 0.2 × ballScale)
+function getBR() { return ballRawR * ballBaseScale * ballScale; }
+
+function palmC(sl) {
+  return new hope.THREE.Vector3(
+    (sl[0].x + sl[5].x + sl[9].x + sl[17].x) / 4,
+    (sl[0].y + sl[5].y + sl[9].y + sl[17].y) / 4,
+    (sl[0].z + sl[5].z + sl[9].z + sl[17].z) / 4
+  );
+}
+function handQ(sl) {
+  const up = new hope.THREE.Vector3().subVectors(sl[9], sl[0]).normalize();
+  const ac = new hope.THREE.Vector3().subVectors(sl[5], sl[17]).normalize();
+  const fw = new hope.THREE.Vector3().crossVectors(up, ac).normalize();
+  const rt = new hope.THREE.Vector3().crossVectors(up, fw).normalize();
+  return new hope.THREE.Quaternion().setFromRotationMatrix(
+    new hope.THREE.Matrix4().makeBasis(rt, up, fw)
+  );
+}
+function cntNr(sl, md) {
+  if (!sl) return 0;
+  let n = 0;
+  for (const i of [0, 4, 5, 8, 9, 12, 13, 16, 17, 20]) {
+    if (sl[i].distanceTo(ballPos) < md) n++;
+  }
+  return n;
+}
+function minLD(sl) {
+  if (!sl) return 999;
+  let m = 999;
+  for (let i = 0; i < 21; i++) {
+    const d = sl[i].distanceTo(ballPos);
+    if (d < m) m = d;
+  }
+  return m;
+}
+function applyBallTransform() {
+  ball.group.position.copy(ballPos);
+  ball.group.quaternion.copy(ballQuat);
+  ball.group.scale.setScalar(ballBaseScale * ballScale);
+}
+
+// ═══════════════ BIRD STATE ═══════════════
+let bird = null, birdState = 'hidden', birdPos, birdQuat, birdOrbitAngle = 0;
+let birdInitScale = 1;
+
+// ═══════════════ BUTTERFLY STATE ═══════════════
+let bfly = null;
+let bflyState = 'hidden';      // hidden | flying | perched
+let bflyPos, bflyQuat;
+let bflyPhase = Math.random() * Math.PI * 2;
+let bflyOrbitR = 0.6, bflyOrbitSpeed = 1.2;
+let bflyPerchHand = -1;
+let bflyInitScale = 1;
+let bflyAnims = {}, bflyFlyAnim = '', bflyIdleAnim = '', bflyCurrentAnim = '';
+
+function playBflyAnim(name, loop = true) {
+  if (!bfly?.mixer) return;
+  const resolved = name === 'hover' || name === 'fly' ? bflyFlyAnim
+                 : name === 'idle' || name === 'perch' ? bflyIdleAnim : name;
+  if (!bflyAnims[resolved] || bflyCurrentAnim === resolved) return;
+  bfly.mixer.stopAllAction();
+  const a = bfly.mixer.clipAction(bflyAnims[resolved]);
+  a.setLoop(loop ? hope.THREE.LoopRepeat : hope.THREE.LoopOnce);
+  if (!loop) a.clampWhenFinished = true;
+  a.play();
+  bflyCurrentAnim = resolved;
+}
+
+/** Check if hand `h` is raised to chest level (centered, between shoulders and hips) */
+function isHandAtChest(hs, h, pose) {
+  if (!hs || !hs[h]) return false;
+  const wrist = hs[h][0];
+  // Must be roughly centered horizontally (middle 60% of frame)
+  if (wrist.x < 0.2 || wrist.x > 0.8) return false;
+  if (pose) {
+    const sY = (pose[11].y + pose[12].y) / 2; // shoulder mid y
+    const hipY = (pose[23].y + pose[24].y) / 2;
+    const chestTop = sY - 0.05;
+    const chestBot = sY + (hipY - sY) * 0.45;
+    return wrist.y >= chestTop && wrist.y <= chestBot;
+  }
+  // Fallback: chest zone roughly y 0.3–0.65
+  return wrist.y > 0.3 && wrist.y < 0.65;
+}
+
+// ── Init ──
+async function init() {
+  els.hud.textContent = 'Starting hopeOS SDK...';
+
+  hope = await HopeOS.init({
+    canvas: document.getElementById('c'),
+    bgVideo: document.getElementById('bgVid'),
+    detectionVideo: document.getElementById('vid'),
+    apiKey: CFG.OPENAI_API_KEY
+  });
+
+  els.hud.textContent = 'Loading assets...';
+
+  // Load assets via SDK loader
+  [ball, bird, bfly] = await Promise.all([
+    loadModel('./assets/basketball.glb', hope.scene, { scale: 0.4 }),
+    loadModel('./assets/bird.glb', hope.scene, { scale: 0.5, collider: 'mesh' }),
+    loadModel('./assets/butterfly.glb', hope.scene, { scale: 0.42, collider: 'mesh' })
+  ]);
+
+  // Match old monolith scale math exactly:
+  //   ballRawR     = max(rawSize)/2          (UNSCALED radius)
+  //   ballBaseScale = 0.4/max(rawSize)        (loader's applied scale)
+  //   getBR() = ballRawR × ballBaseScale × ballScale = 0.2 × ballScale  (world units)
+  // The loader already applied targetScale (= 0.4/max(rawSize)) to group.scale,
+  // and boundingSize = rawSize × targetScale, so we recover raw size from those.
+  ballBaseScale = ball.group.scale.x;
+  const ballMaxScaled = Math.max(ball.boundingSize.x, ball.boundingSize.y, ball.boundingSize.z);
+  const ballRawMax = ballMaxScaled / ballBaseScale;   // undo loader scale → raw size
+  ballRawR = ballRawMax / 2;
+  console.log('[ball] rawR:', ballRawR.toFixed(3), 'baseScale:', ballBaseScale.toFixed(3), '→ world radius:', getBR().toFixed(3));
+
+  birdInitScale = bird.group.scale.x;
+  bflyInitScale = bfly.group.scale.x;
+
+  // ── Butterfly: auto-detect fly/idle anims ──
+  if (bfly.anims) {
+    bflyAnims = bfly.anims;
+    const aNames = Object.keys(bflyAnims);
+    const findAnim = (...keys) => aNames.find(n => keys.some(k => n.toLowerCase().includes(k))) || '';
+    bflyFlyAnim = findAnim('fly', 'flap', 'hover', 'wing', 'flutter') || aNames[0] || '';
+    bflyIdleAnim = findAnim('idle', 'rest', 'perch', 'sit', 'land') || bflyFlyAnim;
+    console.log('[bfly] fly:', bflyFlyAnim, 'idle:', bflyIdleAnim);
+    // Start flapping immediately
+    if (bflyFlyAnim && bfly.mixer) {
+      const a = bfly.mixer.clipAction(bflyAnims[bflyFlyAnim]);
+      a.setLoop(hope.THREE.LoopRepeat);
+      a.play();
+      bflyCurrentAnim = bflyFlyAnim;
+    }
+  }
+
+  // ── Init positions ──
+  ballPos = new hope.THREE.Vector3(0, 0.2, 0);
+  ballQuat = new hope.THREE.Quaternion();
+  birdPos = new hope.THREE.Vector3(0.3, 0.2, 0);
+  birdQuat = new hope.THREE.Quaternion();
+  bflyPos = new hope.THREE.Vector3(0.4, 0.3, 0);
+  bflyQuat = new hope.THREE.Quaternion();
+  grabOff = new hope.THREE.Vector3();
+  grabQO = new hope.THREE.Quaternion();
+
+  // Hide all initially
+  ball.group.visible = false;
+  bird.group.visible = false;
+  bfly.group.visible = false;
+
+  // Voice commands
+  if (hope.voice) {
+    hope.voice
+      .register('fire_on', /\b(fire|flame)\b(?!.*(?:stop|out|off))/, () => execCmd('fire_on'))
+      .register('fire_off', /(stop.?fire|put.?out|extinguish|fire.?off)/, () => execCmd('fire_off'))
+      .register('ball', /\bball\b/, () => execCmd('spawn_ball'))
+      .register('bird', /\b(bird|pigeon)\b/, () => execCmd('spawn_bird'))
+      .register('bfly', /\bbutterfly\b/, () => execCmd('spawn_bfly'))
+      .register('hide', /\b(hide|remove|clear)\b/, () => execCmd('hide'));
+    hope.voice.start();
+    els.vDot.className = 'dot on';
+    els.vLbl.textContent = '🎤 ' + CFG.WHISPER_MODEL;
+  }
+
+  // Register per-frame game logic
+  hope.onFrame(gameLoop);
+
+  els.hud.textContent = 'Ready!';
+  hope.start();
+}
+
+// ── Game loop (runs every frame via SDK) ──
+function gameLoop(dt, frame) {
+  updateBall(frame, dt);
+  updateBird(frame, dt);
+  updateButterfly(frame, dt);
+  updateFire(frame, dt);
+  updateDebug(frame);
+}
+
+// ═══════════════ BASKETBALL (1:1 port of dei_full.html updateBall) ═══════════════
+function updateBall(frame, dt) {
+  if (!ball) return;
+  if (ballState === 'hidden') {
+    ball.group.visible = false;
+    ballCollider.active = false;
+    ballPhysActive = false;
+    return;
+  }
+
+  const hc = frame.handCount;
+  const hs = frame.hands;
+  const sls = frame.sceneLandmarks;
+
+  // Spawn animation
+  if (ballState === 'spawning') {
+    ballScale = Math.min(1, ballScale + 0.04);
+    if (ballScale >= 1) ballState = 'idle';
+    ball.group.visible = true;
+    ball.group.position.copy(ballPos);
+    ball.group.scale.setScalar(ballBaseScale * ballScale);
+    return;
+  }
+
+  const br = getBR();
+  ballCollider.center.copy(ballPos);
+  ballCollider.radius = br;
+  ballCollider.active = true;
+
+  // ── Two-hand pinch: pick up / move / scale the ball between both hands ──
+  let pc2 = 0, pH = [];
+  for (let h = 0; h < Math.min(hc, 2); h++) {
+    if (!hs[h] || !sls[h]) continue;
+    if (isPinch(hs[h])) { pc2++; pH.push(h); }
+  }
+  if (pc2 >= 2 && !ballGrabbed) {
+    const p0 = pinchPoint(sls[pH[0]]), p1 = pinchPoint(sls[pH[1]]);
+    const dist = p0.distanceTo(p1);
+    if (prevPD > 0) ballScale = Math.max(0.15, Math.min(4, ballScale + (dist - prevPD) * 3));
+    prevPD = dist;
+    ballPos.lerpVectors(p0, p1, 0.5);
+    ballPhysActive = false;
+    applyBallTransform();
+    return;
+  }
+  prevPD = 0;
+
+  // ── Proximity grab: hold with one or both hands (palm-follow) ──
+  let bH = -1, bD = 999;
+  for (let h = 0; h < Math.min(hc, 2); h++) {
+    if (!sls[h]) continue;
+    const d = minLD(sls[h]);
+    if (d < bD) { bD = d; bH = h; }
+  }
+  if (bH >= 0 && bD < br + 0.1 && cntNr(sls[bH], br + 0.1) >= 4) {
+    if (!ballGrabbed) {
+      ballGrabbed = true;
+      grabHand = bH;
+      grabOff.subVectors(ballPos, palmC(sls[bH]));
+      grabQO.copy(handQ(sls[bH])).invert().multiply(ballQuat);
+      ballPhysActive = false;
+      grabVelHistory = [];
+    }
+    if (ballGrabbed && grabHand === bH) {
+      const pc = palmC(sls[bH]), hq = handQ(sls[bH]);
+      const prevPos = ballPos.clone();
+      ballPos.lerp(pc.clone().add(grabOff), 0.85);
+      ballQuat.slerp(hq.clone().multiply(grabQO), 0.75);
+      grabVelHistory.push(ballPos.clone().sub(prevPos));
+      if (grabVelHistory.length > 5) grabVelHistory.shift();
+      applyBallTransform();
+      return;
+    }
+  } else if (ballGrabbed) {
+    // ── RELEASE → apply throw velocity → activate physics ──
+    ballGrabbed = false;
+    const CANNON = hope.physics.CANNON;
+    const physWorld = hope.physics.world;
+    if (hope.physics.ready && CANNON) {
+      const vel = new hope.THREE.Vector3();
+      for (const v of grabVelHistory) vel.add(v);
+      if (grabVelHistory.length > 0) vel.divideScalar(grabVelHistory.length).multiplyScalar(60);
+      if (!ballBody) {
+        ballBody = new CANNON.Body({ mass: 0.6, shape: new CANNON.Sphere(br), material: hope.physics._ballMat });
+        physWorld.addBody(ballBody);
+      }
+      ballBody.shapes[0] = new CANNON.Sphere(br);
+      ballBody.updateBoundingRadius();
+      ballBody.position.set(ballPos.x, ballPos.y, ballPos.z);
+      ballBody.velocity.set(vel.x, vel.y, vel.z);
+      ballBody.angularVelocity.set(Math.random() * 2 - 1, Math.random() * 2 - 1, Math.random() * 2 - 1);
+      ballPhysActive = true;
+    }
+    grabVelHistory = [];
+  }
+
+  // ── Physics step: read cannon body back, clamp to floor ──
+  if (ballPhysActive && hope.physics.ready && ballBody) {
+    ballPos.set(ballBody.position.x, ballBody.position.y, ballBody.position.z);
+    ballQuat.set(ballBody.quaternion.x, ballBody.quaternion.y, ballBody.quaternion.z, ballBody.quaternion.w);
+    const floorY = hope.body.floorY;
+    if (ballPos.y < floorY - 1) {
+      ballPos.y = floorY + br;
+      ballBody.position.y = floorY + br;
+      ballBody.velocity.set(0, 0, 0);
+    }
+  }
+
+  // Idle float when not grabbed and not in physics
+  if (!ballGrabbed && !ballPhysActive) {
+    ball.group.position.y += Math.sin(performance.now() * 0.002) * 0.006;
+  }
+
+  applyBallTransform();
+}
+
+
+// ═══════════════ BIRD ═══════════════
+function updateBird(frame, dt) {
+  if (!bird) return;
+  if (birdState === 'hidden') {
+    bird.group.visible = false;
+    if (bird.collider) bird.collider.active = false;
+    return;
+  }
+  bird.group.visible = true;
+  if (bird.collider) bird.collider.active = true;
+  if (bird.mixer) bird.mixer.update(dt);
+
+  if (birdState === 'flying') {
+    birdOrbitAngle += dt * 0.8;
+    const orbR = 0.7, orbY = 0.3 + Math.sin(birdOrbitAngle * 1.5) * 0.15;
+    const tx = Math.cos(birdOrbitAngle) * orbR;
+    const tz = Math.sin(birdOrbitAngle) * orbR * 0.3;
+    const target = new hope.THREE.Vector3(tx, orbY, tz);
+
+    // Avoid body
+    const headPos = hope.body.headPos || new hope.THREE.Vector3();
+    const toBody = target.clone().sub(headPos);
+    if (toBody.length() < 0.4) target.add(toBody.normalize().multiplyScalar(0.3));
+
+    birdPos.lerp(target, 0.05);
+    const fwd = target.clone().sub(birdPos);
+    if (fwd.length() > 0.001) {
+      const m4 = new hope.THREE.Matrix4().lookAt(birdPos, target, new hope.THREE.Vector3(0, 1, 0));
+      birdQuat.slerp(new hope.THREE.Quaternion().setFromRotationMatrix(m4), 0.1);
+    }
+  }
+
+  bird.group.position.copy(birdPos);
+  bird.group.quaternion.copy(birdQuat);
+}
+
+// ═══════════════ BUTTERFLY — with hand-perch behavior ═══════════════
+function updateButterfly(frame, dt) {
+  if (!bfly) return;
+  if (bflyState === 'hidden') {
+    bfly.group.visible = false;
+    if (bfly.collider) bfly.collider.active = false;
+    return;
+  }
+  bfly.group.visible = true;
+  if (bfly.collider) bfly.collider.active = true;
+  if (bfly.mixer) bfly.mixer.update(dt);
+
+  const hc = frame.handCount;
+  const hs = frame.hands;
+  const sls = frame.sceneLandmarks;
+  const pose = frame.pose;
+
+  // Check if any hand is raised to chest level
+  let raiseH = -1;
+  for (let h = 0; h < Math.min(hc, 2); h++) {
+    if (!hs || !hs[h] || !sls[h]) continue;
+    if (isHandAtChest(hs, h, pose)) { raiseH = h; break; }
+  }
+
+  if (bflyState === 'flying') {
+    // Random-ish orbit around body
+    bflyPhase += dt * bflyOrbitSpeed;
+    bflyOrbitR += (Math.random() - 0.5) * dt * 0.3;
+    bflyOrbitR = Math.max(0.3, Math.min(0.9, bflyOrbitR));
+    bflyOrbitSpeed += (Math.random() - 0.5) * dt * 0.5;
+    bflyOrbitSpeed = Math.max(1.0, Math.min(2.8, bflyOrbitSpeed));
+
+    const headPos = hope.body.headPos || new hope.THREE.Vector3();
+    const cx = headPos.x || 0;
+    const cy = (headPos.y || 0) - 0.1;
+    const tx = cx + Math.cos(bflyPhase) * bflyOrbitR;
+    const ty = cy + Math.sin(bflyPhase * 0.7) * 0.15 + 0.1;
+    const tz = Math.sin(bflyPhase * 1.3) * bflyOrbitR * 0.3;
+    const target = new hope.THREE.Vector3(tx, ty, tz);
+
+    // If a hand is raised → home toward palm and perch
+    if (raiseH >= 0 && sls[raiseH]) {
+      const palm = sls[raiseH][9]; // middle finger MCP = top of palm
+      const perchTarget = new hope.THREE.Vector3(palm.x, palm.y + 0.04, palm.z);
+      const dist = bflyPos.distanceTo(perchTarget);
+      if (dist < 0.14) {
+        // PERCH!
+        bflyState = 'perched';
+        bflyPerchHand = raiseH;
+        playBflyAnim('idle');
+        bflyPos.copy(perchTarget);
+      } else {
+        // Blend more aggressively the closer it gets
+        const blend = Math.min(0.92, 0.6 + 0.4 * (1 - Math.min(dist, 1)));
+        target.lerp(perchTarget, blend);
+      }
+    }
+
+    const lerpSpeed = raiseH >= 0 ? 0.14 : 0.07;
+    bflyPos.lerp(target, lerpSpeed);
+
+    const fwd = target.clone().sub(bflyPos);
+    if (fwd.length() > 0.001) {
+      const m4 = new hope.THREE.Matrix4().lookAt(bflyPos, target, new hope.THREE.Vector3(0, 1, 0));
+      bflyQuat.slerp(new hope.THREE.Quaternion().setFromRotationMatrix(m4), 0.12);
+    }
+  }
+
+  if (bflyState === 'perched') {
+    if (bflyPerchHand >= 0 && sls[bflyPerchHand]) {
+      const palm = sls[bflyPerchHand][9];
+      bflyPos.lerp(new hope.THREE.Vector3(palm.x, palm.y + 0.04, palm.z), 0.5);
+      // Take off if hand drops
+      if (hs[bflyPerchHand] && !isHandAtChest(hs, bflyPerchHand, pose)) {
+        bflyState = 'flying';
+        playBflyAnim('hover');
+        bflyPerchHand = -1;
+      }
+    } else {
+      bflyState = 'flying';
+      playBflyAnim('hover');
+      bflyPerchHand = -1;
+    }
+  }
+
+  bfly.group.position.copy(bflyPos);
+  bfly.group.quaternion.copy(bflyQuat);
+}
+
+// ═══════════════ FIRE ═══════════════
+function updateFire(frame, dt) {
+  let rSl = null, lSl = null;
+  for (let h = 0; h < Math.min(frame.handCount, 2); h++) {
+    if (!frame.sceneLandmarks[h]) continue;
+    if (frame.handedness[h] === 'Right') rSl = frame.sceneLandmarks[h];
+    else lSl = frame.sceneLandmarks[h];
+  }
+  hope.fire.update(rSl, lSl, dt);
+  if (hope.hands.right) {
+    const tg = hope.fire.active ? 0.5 : 0;
+    hope.hands.right.uniforms.uGlow.value += (tg - hope.hands.right.uniforms.uGlow.value) * 0.1;
+  }
+  if (hope.hands.left) {
+    const tg = hope.fire.active ? 0.5 : 0;
+    hope.hands.left.uniforms.uGlow.value += (tg - hope.hands.left.uniforms.uGlow.value) * 0.1;
+  }
+}
+
+// ── Commands ──
+function execCmd(act) {
+  switch (act) {
+    case 'spawn_ball':
+      ballState = 'spawning'; ballScale = 0.01; ballPos.set(0, 0.2, 0);
+      ballPhysActive = false; ballGrabbed = false;
+      showAgent('🏀 Ball!', 2500); break;
+    case 'spawn_bird':
+      birdState = 'flying'; birdPos.set(0.3, 0.2, 0);
+      if (bird?.mixer && bird?.anims) {
+        const flyAnim = Object.keys(bird.anims).find(n => n.toLowerCase().includes('flap') || n.toLowerCase().includes('fly'));
+        if (flyAnim) { bird.mixer.stopAllAction(); bird.mixer.clipAction(bird.anims[flyAnim]).play(); }
+      }
+      showAgent('🐦 Bird!', 2500); break;
+    case 'spawn_bfly':
+      bflyState = 'flying'; bflyPos.set(0.4, 0.3, 0); bflyPhase = Math.random() * 6.28;
+      bflyPerchHand = -1;
+      playBflyAnim('hover');
+      showAgent('🦋 Butterfly! Raise your hand to chest level...', 3500); break;
+    case 'fire_on':
+      hope.fire.active = true; showAgent('🔥 Fire!', 2000); break;
+    case 'fire_off':
+      hope.fire.active = false; showAgent('💨 Out.', 1500); break;
+    case 'hide':
+      ballState = 'hidden'; birdState = 'hidden'; bflyState = 'hidden';
+      hope.fire.active = false;
+      hope.deactivateAllColliders();
+      showAgent('Hidden.', 1500); break;
+  }
+}
+
+window._sp = function (cmd) {
+  const map = { ball: 'spawn_ball', bird: 'spawn_bird', fly: 'spawn_bird', bfly: 'spawn_bfly',
+    fire: hope?.fire?.active ? 'fire_off' : 'fire_on', hide: 'hide' };
+  execCmd(map[cmd] || 'hide');
+};
+
+// ── Debug ──
+function updateDebug(frame) {
+  const active = colliders.filter(c => c.active).length;
+  let d = `H:${frame.handCount}`;
+  d += ` Ball:${ballState}${ballGrabbed ? ' G' : ''}${ballPhysActive ? ' P' : ''}`;
+  d += ` Bird:${birdState} Bfly:${bflyState}${bflyPerchHand >= 0 ? '@H' + bflyPerchHand : ''}`;
+  d += `\nColliders:${active}/${colliders.length} Fire:${hope.fire.active ? 'on' : 'off'}`;
+  d += `\nFloor:${hope.body.floorY.toFixed(2)} Body:${frame.pose ? 'yes' : 'no'}`;
+  if (ballState !== 'hidden') d += `\nBallR:${getBR().toFixed(3)} Scale:${ballScale.toFixed(2)}`;
+  els.db.textContent = d;
+}
+
+init().catch(e => { console.error(e); els.hud.textContent = 'Error: ' + e.message; });
+</script>
+</body>
+</html>

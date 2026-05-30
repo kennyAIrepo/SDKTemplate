@@ -1,0 +1,267 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>hopeOS — Enter World</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{overflow:hidden;background:#0a0a0f;font-family:'SF Mono','Fira Code',monospace;color:#cce}
+#bgVid{position:fixed;top:0;left:0;width:100vw;height:100vh;object-fit:cover;transform:scaleX(-1);z-index:0;opacity:0;transition:opacity .4s}
+#bgVid.show{opacity:0.18}  /* faint webcam ghost in body-embedded mode */
+#c{position:fixed;top:0;left:0;width:100vw;height:100vh;z-index:1}
+video.h{display:none}
+
+/* ── Entry overlay ── */
+#entry{position:fixed;inset:0;z-index:50;background:radial-gradient(ellipse at center,#12121f 0%,#0a0a0f 100%);
+  display:flex;flex-direction:column;align-items:center;justify-content:center;gap:22px;transition:opacity .6s}
+#entry.gone{opacity:0;pointer-events:none}
+#entry h1{font-size:22px;letter-spacing:3px;color:#4a7fb5;font-weight:600}
+#entry h1 b{color:#d4a843}
+.sub{font-size:12px;color:#778;letter-spacing:1px;margin-top:-12px}
+.group{display:flex;flex-direction:column;gap:8px;align-items:center}
+.glabel{font-size:10px;color:#667;letter-spacing:2px;text-transform:uppercase}
+.opts{display:flex;gap:10px}
+.opt{padding:12px 20px;background:rgba(40,60,100,.25);border:1px solid rgba(80,140,220,.3);
+  border-radius:10px;cursor:pointer;font-size:12px;color:#9bf;transition:all .2s;min-width:140px;text-align:center}
+.opt:hover{background:rgba(60,90,150,.4)}
+.opt.sel{background:rgba(74,127,181,.5);border-color:#4a7fb5;color:#fff;box-shadow:0 0 16px rgba(74,127,181,.3)}
+.opt small{display:block;font-size:9px;color:#88a;margin-top:4px;line-height:1.4}
+#play{margin-top:8px;padding:16px 48px;background:linear-gradient(135deg,#4a7fb5,#3a6fa5);border:none;
+  border-radius:12px;color:#fff;font-size:15px;font-weight:600;letter-spacing:2px;cursor:pointer;
+  font-family:inherit;transition:transform .15s,box-shadow .2s;box-shadow:0 4px 20px rgba(74,127,181,.4)}
+#play:hover{transform:translateY(-2px);box-shadow:0 6px 28px rgba(74,127,181,.6)}
+#play:disabled{opacity:.4;cursor:wait}
+
+/* ── In-world HUD ── */
+#hud{position:fixed;top:14px;left:50%;transform:translateX(-50%);z-index:20;font-size:11px;
+  background:rgba(0,0,0,.5);padding:6px 16px;border-radius:6px;backdrop-filter:blur(6px);
+  color:#9bf;text-align:center;pointer-events:none;opacity:0;transition:opacity .4s}
+#hud.show{opacity:1}
+#legend{position:fixed;bottom:14px;left:14px;z-index:20;font-size:10px;line-height:1.7;color:#89a;
+  background:rgba(0,0,0,.45);padding:10px 14px;border-radius:8px;backdrop-filter:blur(6px);
+  opacity:0;transition:opacity .4s;max-width:260px}
+#legend.show{opacity:1}
+#legend b{color:#9bf}
+#debug{position:fixed;bottom:14px;right:14px;z-index:20;font-size:9px;color:rgba(120,200,160,.5);
+  white-space:pre;text-align:right;pointer-events:none}
+#exitBtn{position:fixed;top:14px;right:14px;z-index:25;padding:6px 14px;background:rgba(60,30,30,.5);
+  border:1px solid rgba(200,80,80,.3);border-radius:6px;color:#f99;font-size:10px;cursor:pointer;
+  font-family:inherit;opacity:0;transition:opacity .4s}
+#exitBtn.show{opacity:1}
+</style>
+
+<script type="importmap">
+{"imports":{
+  "three":"https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+  "three/addons/":"https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/",
+  "@dimforge/rapier3d-compat":"https://cdn.jsdelivr.net/npm/@dimforge/rapier3d-compat@0.14.0/rapier.es.js"
+}}
+</script>
+</head>
+<body>
+<video id="bgVid" playsinline muted></video>
+<canvas id="c"></canvas>
+<video id="vid" class="h" playsinline></video>
+
+<!-- Entry / play overlay -->
+<div id="entry">
+  <h1>h<b>0</b>p<b>3</b> // ENTER WORLD</h1>
+  <div class="sub">step into the scene as an avatar</div>
+
+  <div class="group">
+    <div class="glabel">Embodiment</div>
+    <div class="opts" id="modeOpts">
+      <div class="opt sel" data-mode="firstPerson">First-Person POV
+        <small>camera = your eyes · holo hands reach into the scene</small></div>
+      <div class="opt" data-mode="bodyEmbedded">See Yourself
+        <small>watch your avatar stand in the space</small></div>
+    </div>
+  </div>
+
+  <div class="group">
+    <div class="glabel">Navigation</div>
+    <div class="opts" id="navOpts">
+      <div class="opt sel" data-nav="gesture">Hands (Spatial)
+        <small>point to walk · steer by hand position</small></div>
+      <div class="opt" data-nav="keyboard">Keyboard
+        <small>WASD + mouse · classic fallback</small></div>
+    </div>
+  </div>
+
+  <button id="play" disabled>LOADING…</button>
+</div>
+
+<!-- In-world UI -->
+<div id="hud"></div>
+<div id="legend"></div>
+<div id="debug"></div>
+<button id="exitBtn">⏏ EXIT</button>
+
+<script type="module">
+import { HopeOS } from './sdk/hopeos.js';
+import { WorldTemplate }   from './sdk/world/template.js';
+import { AvatarNavigator } from './sdk/world/avatar-nav.js';
+import { EmbodimentManager } from './sdk/world/embodiment.js';
+import CFG from './dei_config.js';
+
+// ═══════════════ DROP-IN SCENE CONFIG ═══════════════
+// The single entry point. Next scene = change these 4 lines.
+const WORLD_CONFIG = {
+  modelUrl: './worlds/indoor_gallery.glb',  // ← drop any GLB here
+  scale:    10.0,                            // Meshy models ~1m → room-size
+  offset:   { x: 0, y: 3.3, z: 0 },          // lift so floor ≈ Y=0
+  spawn:    { x: 0, y: 1.5, z: 0 },          // avatar start (inside the space)
+};
+
+const els = {
+  entry: document.getElementById('entry'),
+  play: document.getElementById('play'),
+  hud: document.getElementById('hud'),
+  legend: document.getElementById('legend'),
+  debug: document.getElementById('debug'),
+  exit: document.getElementById('exitBtn'),
+  bgVid: document.getElementById('bgVid'),
+};
+
+let chosenMode = 'firstPerson';
+let chosenNav = 'gesture';
+
+// Option selectors
+document.getElementById('modeOpts').addEventListener('click', e => {
+  const o = e.target.closest('.opt'); if (!o) return;
+  document.querySelectorAll('#modeOpts .opt').forEach(x => x.classList.remove('sel'));
+  o.classList.add('sel'); chosenMode = o.dataset.mode;
+});
+document.getElementById('navOpts').addEventListener('click', e => {
+  const o = e.target.closest('.opt'); if (!o) return;
+  document.querySelectorAll('#navOpts .opt').forEach(x => x.classList.remove('sel'));
+  o.classList.add('sel'); chosenNav = o.dataset.nav;
+});
+
+let hope, world, nav, embody, running = false;
+
+async function boot() {
+  // SDK: tracking + holo hands (no AR overlay camera bg in world mode)
+  hope = await HopeOS.init({
+    canvas: document.getElementById('c'),
+    bgVideo: els.bgVid,
+    detectionVideo: document.getElementById('vid'),
+    apiKey: CFG.OPENAI_API_KEY
+  });
+  // We control hands ourselves (for first-person remap)
+  hope.externalHandControl = true;
+
+  // Solid scene background (we see the 3D world, not the webcam)
+  hope.scene.background = new hope.THREE.Color(0x1a1a2e);
+  hope.scene.fog = new hope.THREE.Fog(0x1a1a2e, 30, 120);
+
+  // Build the world template (Rapier physics + GLB + character controller)
+  world = await WorldTemplate.create({
+    scene: hope.scene,
+    renderer: hope.renderer,
+    modelUrl: WORLD_CONFIG.modelUrl,
+    scale: WORLD_CONFIG.scale,
+    offset: WORLD_CONFIG.offset,
+    spawn: WORLD_CONFIG.spawn,
+  });
+
+  nav = new AvatarNavigator({ mode: chosenNav });
+  nav.attachKeyboard(document.getElementById('c'));
+
+  embody = new EmbodimentManager({ mode: chosenMode });
+
+  // Hook our per-frame world driver into the SDK loop
+  hope.onFrame(worldFrame);
+
+  els.play.disabled = false;
+  els.play.textContent = '▶ ENTER';
+}
+
+function worldFrame(dt, frame) {
+  if (!running) return;
+
+  // 1. Navigation intent (keyboard or gesture)
+  const intent = nav.update(dt, frame);
+
+  // 2. Drive the avatar through the world (physics, collision, gravity)
+  world.step(dt, intent);
+
+  // 3. Position camera for the current embodiment mode
+  embody.updateCamera(world, hope.camera);
+
+  // 4. Resolve hand placement for the mode, then deform holo hands
+  const { handsSceneLandmarks, handednessOut } = embody.resolveHands(frame, world, hope.camera);
+  let rOK = false, lOK = false;
+  for (let h = 0; h < Math.min(frame.handCount, 2); h++) {
+    const sl = handsSceneLandmarks[h];
+    if (!sl) continue;
+    const isR = handednessOut[h] === 'Right';
+    if (isR && !rOK && hope.hands.right) { hope.hands.right.deform(sl); rOK = true; }
+    else if (!isR && !lOK && hope.hands.left) { hope.hands.left.deform(sl); lOK = true; }
+  }
+  if (!rOK && hope.hands.right) hope.hands.right.grp.visible = false;
+  if (!lOK && hope.hands.left) hope.hands.left.grp.visible = false;
+
+  // 5. HUD
+  updateHUD(frame);
+}
+
+function updateHUD(frame) {
+  const p = world.getAvatarPosition();
+  els.debug.textContent =
+    `mode: ${embody.mode}\nnav: ${nav.mode}\n` +
+    `gesture: ${nav.currentGesture}\nwalk: ${nav.walkState}\n` +
+    `pos: ${p.x.toFixed(1)}, ${p.y.toFixed(1)}, ${p.z.toFixed(1)}\n` +
+    `hands: ${frame.handCount}`;
+}
+
+function setLegend() {
+  if (nav.mode === 'keyboard') {
+    els.legend.innerHTML =
+      `<b>KEYBOARD</b><br>WASD — move · Mouse — look<br>Space — jump · Shift — sprint<br>Click canvas to capture mouse`;
+  } else {
+    els.legend.innerHTML =
+      `<b>HAND CONTROLS</b><br>` +
+      `☝️ <b>Point</b> — walk forward<br>` +
+      `🖐️ <b>Open palm</b> — sprint<br>` +
+      `✊ <b>Fist</b> — stop<br>` +
+      `☝️⬆️ <b>Jab up</b> — jump<br>` +
+      `<b>Move hand</b> L/R/up/down — steer view<br>` +
+      `(center = hold still)`;
+  }
+}
+
+els.play.addEventListener('click', () => {
+  nav.setMode(chosenNav);
+  embody.setMode(chosenMode);
+  setLegend();
+
+  // Body-embedded shows a faint webcam ghost; first-person is pure scene
+  els.bgVid.classList.toggle('show', chosenMode === 'bodyEmbedded');
+
+  els.entry.classList.add('gone');
+  els.hud.classList.add('show');
+  els.legend.classList.add('show');
+  els.exit.classList.add('show');
+  els.hud.textContent = chosenMode === 'firstPerson'
+    ? 'You are in the world — raise a hand to navigate'
+    : 'There you are — explore the space';
+
+  running = true;
+  hope.start();
+});
+
+els.exit.addEventListener('click', () => {
+  running = false;
+  els.entry.classList.remove('gone');
+  els.hud.classList.remove('show');
+  els.legend.classList.remove('show');
+  els.exit.classList.remove('show');
+  els.bgVid.classList.remove('show');
+});
+
+boot().catch(e => { console.error(e); els.play.textContent = 'ERROR: ' + e.message; });
+</script>
+</body>
+</html>
